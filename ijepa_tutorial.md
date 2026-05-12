@@ -18,6 +18,10 @@ Both work. Both have a complaint. Pixel reconstruction spends model capacity on 
 
 I-JEPA proposes a third option: **predict embeddings of hidden patches, not their pixels**. We never decode back to RGB. Everything happens in latent space.
 
+![Three self-supervised architectures](./figs/jepa_architecture_comparison.png)
+
+Figure 1 from the I-JEPA paper. (a) Joint-Embedding: compare two encodings — contrastive methods. (b) Generative: decode back to pixels — MAE/BEiT. (c) Joint-Embedding Predictive: predict the *embedding* of one view from the *embedding* of another — I-JEPA's family.
+
 ## The setting
 
 We train on CIFAR-10 — 50,000 RGB images, 32×32 pixels, ten classes. The image is cut into 4×4 patches, giving an 8×8 = 64-patch grid.
@@ -167,6 +171,10 @@ A few details worth noting:
 - The per-item context lengths vary — different images lose different amounts to overlap. We trim each item to the batch-wide minimum via random subsample. Random subsample (rather than `c[:L]`) avoids biasing the model toward low-index spatial positions.
 
 ## The loss
+
+![I-JEPA training diagram](./figs/ijepa_architecture.png)
+
+Figure 2 from the I-JEPA paper. The context encoder $f_\theta$ processes context patches; the target encoder $f_{\bar\theta}$ processes the full image; the predictor $g_\phi$ takes context embeddings + target positions and outputs predicted target embeddings; the L2 loss matches predictions against target encoder outputs. Different colors show that $g_\phi$ is called once per target block.
 
 The paper's objective is:
 
