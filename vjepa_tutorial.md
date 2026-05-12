@@ -85,7 +85,7 @@ class VideoEncoder(nn.Module):                          # f_theta (context encod
 Two differences vs. I-JEPA's `Encoder`:
 
 1. **`Conv3d` instead of `Conv2d`**: the kernel spans 2 frames × 16 spatial pixels.
-2. **3D positional embedding**: `sincos_3d` concatenates a 1D temporal sin-cos for time with a 2D sin-cos for spatial. Time gets 25% of the feature dimension; spatial gets the remaining 75%.
+2. **3D positional embedding**: `sincos_3d` concatenates a 1D temporal sin-cos for time with a 2D sin-cos for spatial. The paper just says "3D sin-cos" without prescribing how the dimensions are split; the 25/75 temporal/spatial split here follows the official repo.
 
 Everything downstream of this — the EMA target encoder, the predictor with mask-token queries — is structurally identical to I-JEPA.
 
@@ -132,11 +132,11 @@ The auto-cap (`eff_scale = min(scale, 0.5)`) handles our tiny 4×4 spatial grid.
 
 ## The loss
 
-The objective is the same as I-JEPA, just applied per mask group:
+The objective is the same as I-JEPA's, just applied per mask group:
 
-$$\mathcal{L} = \frac{1}{|G|} \sum_{g \in G} \frac{1}{|B_g|} \sum_{j \in B_g} \|\hat{s}_{y_j}^{(g)} - s_{y_j}\|_1$$
+$$\mathcal{L}_g = \frac{1}{|B_g|} \sum_{j \in B_g} \|\hat{s}_{y_j}^{(g)} - s_{y_j}\|_1, \qquad \mathcal{L} = \frac{1}{|G|} \sum_{g \in G} \mathcal{L}_g$$
 
-with $G = \{\text{short}, \text{long}\}$ the two mask groups and $B_g$ the set of patch indices that group $g$ masks. The official V-JEPA config sets the loss exponent to **1.0** (L1), not 2 (L2 as in I-JEPA).
+with $G = \{\text{short}, \text{long}\}$ the two mask groups and $B_g$ the set of patch indices that group $g$ masks. The official V-JEPA config sets the loss exponent to **1.0** (L1), not 2 (L2 as in I-JEPA). The paper writes the loss per-mask (Eq. 2) and does not specify how the two groups are combined — averaging across groups is the convention from the reference code.
 
 Code map in `train()`:
 
