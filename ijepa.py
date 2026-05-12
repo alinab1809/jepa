@@ -122,7 +122,8 @@ def sample_ijepa_masks(B, grid, n_targets=4, min_ctx=4, rng=None):
     return [sorted(rng.sample(c, L)) for c in ctx_list], tgt_lists
 
 
-def train(epochs=8, batch_size=256, lr=3e-4, wd=0.05, ema_start=0.996, ema_end=1.0, device=None):
+def train(epochs=8, batch_size=256, lr=3e-4, wd=0.05, ema_start=0.996, ema_end=1.0,
+          device=None, on_epoch_end=None):
     device = device or pick_device(); print(f"device: {device}")
     tfm = transforms.Compose([transforms.RandomResizedCrop(32, scale=(0.3, 1.0)),
                               transforms.ToTensor(), transforms.Normalize(MEAN, STD)])
@@ -134,6 +135,9 @@ def train(epochs=8, batch_size=256, lr=3e-4, wd=0.05, ema_start=0.996, ema_end=1
     opt = torch.optim.AdamW(param_groups([ctx_enc, pred], wd), lr=lr)
     total = epochs * len(loader); rng = random.Random(0); losses = []; step = 0
     D = ctx_enc.dim
+    if on_epoch_end is not None:
+        on_epoch_end({"epoch": -1, "ctx_enc": ctx_enc, "tgt_enc": tgt_enc,
+                      "predictor": pred, "step": 0})
     for epoch in range(epochs):
         for imgs, _ in loader:
             imgs = imgs.to(device)
@@ -153,6 +157,9 @@ def train(epochs=8, batch_size=256, lr=3e-4, wd=0.05, ema_start=0.996, ema_end=1
                 print(f"ep={epoch} step={step:5d} loss={loss.item():.4f} "
                       f"lr={opt.param_groups[0]['lr']:.2e} ema={m:.4f}")
             step += 1
+        if on_epoch_end is not None:
+            on_epoch_end({"epoch": epoch, "ctx_enc": ctx_enc, "tgt_enc": tgt_enc,
+                          "predictor": pred, "step": step})
     return {"ctx_enc": ctx_enc, "tgt_enc": tgt_enc, "predictor": pred,
             "losses": losses, "loader": loader, "device": device}
 

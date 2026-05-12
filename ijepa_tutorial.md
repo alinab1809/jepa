@@ -50,6 +50,10 @@ Pixels are spatially correlated. If you mask a single 4×4 patch in the middle o
 
 A *block* of held-out patches breaks that shortcut. To predict a block that is, say, 12 patches wide, the model has to use information from farther away. Distant correlations are more semantic than local ones, so the model is pushed toward higher-level features.
 
+![Mask grid](./samples/ijepa_masks.png)
+
+Eight CIFAR images, each with its own context (row 2) and four target blocks (rows 3–6). Block **sizes** are shared across the batch; **locations** are sampled per image.
+
 ## Building blocks
 
 I-JEPA has four pieces. We will build each, then assemble them.
@@ -240,7 +244,7 @@ Train the algorithm only:
 python ijepa.py
 ```
 
-Train plus write the mask grid, loss curve, PCA scatter of features, and run a linear probe:
+Train plus write the mask grid, loss curve, PCA/LDA/t-SNE scatter of features, and run a linear probe:
 
 ```bash
 python ijepa_extras.py
@@ -248,13 +252,23 @@ python ijepa_extras.py
 
 The extras module imports `ijepa` and adds visualization — the algorithm file stays focused on the algorithm.
 
+The default is 8 epochs. The plots in this post come from `main(epochs=100)`, which takes ~1 hour on an M-series Mac.
+
 ## Results
 
-Training ran for 8 epochs on a single Apple M-series device. The loss dropped from about 0.55 to 0.10. The EMA momentum rose from 0.996 to 0.9999 over the same span.
+Training ran for 100 epochs on a single Apple M-series device. The loss dropped from about 0.55 to ~0.08 and stabilized.
+
+![Loss curve](./samples/ijepa_loss.png)
 
 The standard sanity check for a self-supervised method is a *linear probe*: freeze the encoder, train one linear layer on labeled data, see how well it classifies. If the features carry class information, even a linear layer can separate them.
 
-On CIFAR-10, a linear probe over the EMA target encoder reached **about 28% test accuracy** with 3 probe epochs. A supervised baseline with the same architecture and training budget reaches above 70%. The gap is expected — we trained for 8 epochs on a tiny ViT, and the reference numbers come from ViT-Huge trained for 300 epochs on ImageNet. The point of this implementation is the algorithm shape, not the leaderboard.
+On CIFAR-10, a linear probe over the EMA target encoder reached **52.7% test accuracy** with 3 probe epochs after 100 epochs of pretraining. (At 8 epochs the probe gives ~35%; the gap to 52% comes from more training time on the same tiny ViT.) A supervised baseline with the same architecture and training budget reaches above 70%. The full gap to the I-JEPA paper's numbers is expected — the paper trains ViT-Huge on ImageNet for 300 epochs. The point of this implementation is the algorithm shape, not the leaderboard.
+
+To see the learning visually, we snapshot test-set features after every 10th epoch and project them with t-SNE:
+
+![t-SNE evolution](./samples/ijepa_tsne_evolution.png)
+
+The init panel (random encoder) shows a featureless point cloud. By epoch 9 distinct local clusters are forming. By epoch 99 those clusters are partially class-coherent — regions where one color dominates — even though the encoder never saw a class label. That is what self-supervised learning looks like when it works.
 
 ## What's next
 

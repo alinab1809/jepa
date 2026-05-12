@@ -118,28 +118,116 @@ def linear_probe(encoder, test_loader, device, epochs=3, batch_size=512):
     return acc
 
 
+def save_pca_grid(snapshots, path):
+    """snapshots: list of (epoch, feats, labels). Renders one PCA panel per epoch."""
+    n = len(snapshots)
+    cols = min(4, n); rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.4, rows * 3.4), squeeze=False)
+    for i, (ep, feats, labels) in enumerate(snapshots):
+        x = feats - feats.mean(0, keepdim=True)
+        _, _, v = torch.linalg.svd(x, full_matrices=False)
+        proj = x @ v[:2].T
+        ax = axes[i // cols][i % cols]
+        ax.scatter(proj[:, 0].numpy(), proj[:, 1].numpy(), c=labels.numpy(),
+                   cmap="tab10", s=4, alpha=0.7)
+        ax.set_title("init (random)" if ep < 0 else f"after epoch {ep}", fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+    for j in range(n, rows * cols):
+        axes[j // cols][j % cols].axis("off")
+    fig.suptitle("I-JEPA target-encoder features (PCA) across epochs", fontsize=12)
+    plt.tight_layout(); plt.savefig(path, dpi=110); plt.close()
+
+
+def lda_2d(feats, labels, n_classes=10, reg=1e-3):
+    """Project features onto the 2 LDA directions (max between/within-class variance)."""
+    mu = feats.mean(0)
+    D = feats.size(1)
+    Sw = torch.zeros(D, D); Sb = torch.zeros(D, D)
+    for k in range(n_classes):
+        mask = labels == k
+        nk = mask.sum().item()
+        if nk == 0: continue
+        fk = feats[mask]; mu_k = fk.mean(0)
+        diff = fk - mu_k; Sw += diff.T @ diff
+        d = (mu_k - mu).unsqueeze(1); Sb += nk * (d @ d.T)
+    Sw = Sw + reg * torch.eye(D)
+    eigvals, eigvecs = torch.linalg.eig(torch.linalg.solve(Sw, Sb))
+    order = torch.argsort(eigvals.real, descending=True)
+    return (feats - mu) @ eigvecs.real[:, order[:2]]
+
+
+def save_tsne_grid(snapshots, path, perplexity=30, max_iter=500):
+    """Nonlinear projection. Slower than PCA/LDA -- ~10-30s per snapshot."""
+    from sklearn.manifold import TSNE
+    n = len(snapshots)
+    cols = min(4, n); rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.4, rows * 3.4), squeeze=False)
+    for i, (ep, feats, labels) in enumerate(snapshots):
+        proj = TSNE(n_components=2, perplexity=perplexity, max_iter=max_iter,
+                    init="pca", random_state=0).fit_transform(feats.float().numpy())
+        ax = axes[i // cols][i % cols]
+        ax.scatter(proj[:, 0], proj[:, 1], c=labels.numpy(), cmap="tab10", s=4, alpha=0.7)
+        ax.set_title("init (random)" if ep < 0 else f"after epoch {ep}", fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+    for j in range(n, rows * cols):
+        axes[j // cols][j % cols].axis("off")
+    fig.suptitle("I-JEPA target-encoder features (t-SNE) across epochs", fontsize=12)
+    plt.tight_layout(); plt.savefig(path, dpi=110); plt.close()
+
+
+def save_lda_grid(snapshots, path):
+    """snapshots: list of (epoch, feats, labels). Renders one LDA panel per epoch."""
+    n = len(snapshots)
+    cols = min(4, n); rows = (n + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.4, rows * 3.4), squeeze=False)
+    for i, (ep, feats, labels) in enumerate(snapshots):
+        proj = lda_2d(feats.float(), labels)
+        ax = axes[i // cols][i % cols]
+        ax.scatter(proj[:, 0].numpy(), proj[:, 1].numpy(), c=labels.numpy(),
+                   cmap="tab10", s=4, alpha=0.7)
+        ax.set_title("init (random)" if ep < 0 else f"after epoch {ep}", fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+    for j in range(n, rows * cols):
+        axes[j // cols][j % cols].axis("off")
+    fig.suptitle("I-JEPA target-encoder features (LDA) across epochs", fontsize=12)
+    plt.tight_layout(); plt.savefig(path, dpi=110); plt.close()
+
+
 # ---------- driver ----------
 
 def main(epochs=8):
     os.makedirs(SAMPLES_DIR, exist_ok=True)
-    out = _train(epochs=epochs)
-
-    # mask snapshot from a fresh batch (using the same RNG seed for repeatability)
-    imgs, _ = next(iter(out["loader"]))
-    ctx_list, tgt_lists = sample_ijepa_masks(imgs.size(0), out["ctx_enc"].grid,
-                                              rng=random.Random(42))
-    save_mask_grid(imgs, ctx_list, tgt_lists,
-                   out["ctx_enc"].grid, out["ctx_enc"].patch_size,
-                   f"{SAMPLES_DIR}/ijepa_masks.png")
-
-    save_loss_curve(out["losses"], f"{SAMPLES_DIR}/ijepa_loss.png")
 
     tfm = transforms.Compose([transforms.ToTensor(), transforms.Normalize(MEAN, STD)])
     test_ds = datasets.CIFAR10("./data", train=False, download=True, transform=tfm)
     test_loader = DataLoader(test_ds, batch_size=256, num_workers=2)
 
-    feats, labels = compute_test_features(out["tgt_enc"], test_loader, out["device"])
-    save_pca(feats, labels, f"{SAMPLES_DIR}/ijepa_pca.png", "PCA after training")
+    snapshots = []
+    # subsample so the per-epoch grids stay readable across long training
+    every = max(1, epochs // 10)
+
+    def on_epoch_end(state):
+        ep = state["epoch"]
+        if ep != -1 and ep != epochs - 1 and (ep + 1) % every != 0:
+            return
+        feats, labels = compute_test_features(state["tgt_enc"], test_loader, state["tgt_enc"].pos.device)
+        snapshots.append((ep, feats, labels))
+        save_pca(feats, labels, f"{SAMPLES_DIR}/ijepa_pca_ep{ep}.png",
+                 f"PCA after epoch {ep}" if ep >= 0 else "PCA at init")
+
+    out = _train(epochs=epochs, on_epoch_end=on_epoch_end)
+
+    # mask snapshot from a fresh batch
+    imgs, _ = next(iter(out["loader"]))
+    ctx_list, tgt_lists = sample_ijepa_masks(imgs.size(0), out["ctx_enc"].grid,
+                                              rng=random.Random(42))
+    save_mask_grid(imgs, ctx_list, tgt_lists, out["ctx_enc"].grid,
+                   out["ctx_enc"].patch_size, f"{SAMPLES_DIR}/ijepa_masks.png")
+
+    save_loss_curve(out["losses"], f"{SAMPLES_DIR}/ijepa_loss.png")
+    save_pca_grid(snapshots, f"{SAMPLES_DIR}/ijepa_pca_evolution.png")
+    save_lda_grid(snapshots, f"{SAMPLES_DIR}/ijepa_lda_evolution.png")
+    save_tsne_grid(snapshots, f"{SAMPLES_DIR}/ijepa_tsne_evolution.png")
 
     linear_probe(out["tgt_enc"], test_loader, out["device"])
     print(f"artifacts in ./{SAMPLES_DIR}/")
