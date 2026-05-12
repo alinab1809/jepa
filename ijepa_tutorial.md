@@ -190,7 +190,7 @@ Reading the symbols:
 - $f_{\bar\theta}$ is the **target encoder**, an EMA copy of $f_\theta$ (no gradient).
 - $g_\phi$ is the **predictor**; called once per target block.
 - $B_i$ is the set of patch indices for the $i$-th target block; $M$ is the number of target blocks (4 in our setup).
-- $\hat{s}_{y_j}$ and $s_{y_j}$ are the predicted and target embeddings for patch $j$.
+- $\hat{s}_j$ and $s_j$ are the predicted and target embeddings for patch $j$ (the $y$ subscript in the equation marks them as target-encoder space).
 
 Mapping to the code in `train()`:
 
