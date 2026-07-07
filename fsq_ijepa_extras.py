@@ -3,7 +3,7 @@
 Kept separate from ijepa.py to keep the algorithm file focused. Run this file
 directly to: train -> save mask grid + loss curve + PCA -> run linear probe.
 """
-
+import argparse
 import os
 import random
 
@@ -15,7 +15,7 @@ import wandb
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-from ijepa import MEAN, STD, sample_ijepa_masks, train as _train
+from fsq_ijepa import MEAN, STD, sample_ijepa_masks, train as _train
 
 SAMPLES_DIR = "samples"
 
@@ -196,8 +196,9 @@ def save_lda_grid(snapshots, path):
 
 # ---------- driver ----------
 
-def main(epochs=8):
-    wandb.init("alinaboehm", "discrete-jepa", name="continuous_baseline")
+def main(epochs=8, levels=4, dim=4):
+    wandb.init("alinaboehm", "discrete-jepa", name=f"fsq_L{levels}_dim{dim}",
+               config={"epochs": epochs, "levels": levels, "dim": dim})
     os.makedirs(SAMPLES_DIR, exist_ok=True)
 
     tfm = transforms.Compose([transforms.ToTensor(), transforms.Normalize(MEAN, STD)])
@@ -239,4 +240,9 @@ def main(epochs=8):
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=8)
+    parser.add_argument("--levels", type=int, default=4)
+    parser.add_argument("--dim", type=int, default=4)
+    args = parser.parse_args()
+    main(args.epochs, args.levels, args.dim)

@@ -1,9 +1,10 @@
 """Minimal I-JEPA: EMA target, 4 target blocks, context block, smooth-L1 on LN targets."""
 import copy, math, random
 import torch, torch.nn as nn, torch.nn.functional as F
-import wandb
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+from vector_quantize_pytorch import finite_scalar_quantization as fsq
+import wandb
 
 MEAN, STD = (0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)
 
@@ -51,6 +52,37 @@ def pick_device():
     return "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
 
+def compute_fsq_metrics(target_indices, total_codebook_size):
+    """
+    Args:
+        target_indices (Tensor): Integer indices returned by FSQ. Shape: (Batch, Seq) or (Batch, H, W)
+        total_codebook_size (int): The total number of codes (multiplication of all FSQ levels)
+    """
+    # 1. Flatten to a 1D tensor of all tokens in the current batch
+    flat_indices = target_indices.detach().view(-1)
+
+    # 2. Codebook Usage Percentage
+    # Find how many unique indices were actively hit in this batch
+    unique_indices = torch.unique(flat_indices)
+    codebook_usage = len(unique_indices) / total_codebook_size
+
+    # 3. Perplexity (Entropy-based utilization)
+    # Calculate the empirical probability distribution of the codes in this batch
+    counts = torch.bincount(flat_indices, minlength=total_codebook_size).float()
+    probs = counts / counts.sum()
+
+    # Avoid log(0) by adding a small epsilon where probs > 0
+    entropy = -torch.sum(probs * torch.log(probs + 1e-10))
+    perplexity = torch.exp(entropy)
+    normalized_perplexity = perplexity / total_codebook_size
+
+    return {
+        "codebook_usage_pct": codebook_usage * 100,  # e.g., 45.2%
+        "perplexity": perplexity.item(),  # e.g., 128.4 (out of total_codebook_size)
+        "normalized_perplexity": normalized_perplexity.item()  # scale of 0 to 1
+    }
+
+
 class Encoder(nn.Module):                                 # f_theta (context encoder)
     def __init__(self, img_size=32, patch_size=4, in_chans=3, dim=128, depth=6, heads=4):
         super().__init__()
@@ -88,6 +120,23 @@ class Predictor(nn.Module):                              # g_phi
         for blk in self.blocks: x = blk(x)
         return self.out_proj(self.norm(x[:, -T:]))
 
+class FSQPredictor(nn.Module):                              # g_phi
+    def __init__(self, grid, enc_dim=128, dim=64, depth=4, heads=4, fsq_dim=4, fsq_L=8):
+        super().__init__()
+        self.in_proj = nn.Linear(enc_dim, dim); self.out_proj = nn.Linear(dim, fsq_dim*fsq_L)
+        self.mask_token = nn.Parameter(torch.zeros(1, 1, dim)); nn.init.trunc_normal_(self.mask_token, std=0.02)
+        self.register_buffer("pos", sincos_2d(grid, grid, dim))
+        self.blocks = nn.ModuleList([Block(dim, heads) for _ in range(depth)])
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
+
+    def forward(self, ctx, ctx_idx, tgt_idx):
+        B, T = ctx.size(0), tgt_idx.size(1)
+        x = torch.cat([self.in_proj(ctx) + self.pos[ctx_idx],
+                       self.mask_token.expand(B, T, -1) + self.pos[tgt_idx]], dim=1)
+        for blk in self.blocks: x = blk(x)
+
+        return self.out_proj(self.norm(x[:, -T:]))
+
 
 def _bsize(g, s, ar):
     a = s * g * g
@@ -119,7 +168,7 @@ def sample_ijepa_masks(B, grid, n_targets=4, min_ctx=4, rng=None):
 
 
 def train(epochs=8, batch_size=256, lr=3e-4, wd=0.05, ema_start=0.996, ema_end=1.0,
-          device=None, on_epoch_end=None):
+          device=None, on_epoch_end=None, fsq_dim=4, fsq_L=8):
     device = device or pick_device(); print(f"device: {device}")
     tfm = transforms.Compose([transforms.RandomResizedCrop(32, scale=(0.3, 1.0)),
                               transforms.ToTensor(), transforms.Normalize(MEAN, STD)])
@@ -127,10 +176,16 @@ def train(epochs=8, batch_size=256, lr=3e-4, wd=0.05, ema_start=0.996, ema_end=1
     loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True)
     ctx_enc = Encoder().to(device); tgt_enc = copy.deepcopy(ctx_enc).to(device)
     for p in tgt_enc.parameters(): p.requires_grad_(False)
-    pred = Predictor(grid=ctx_enc.grid).to(device)
-    opt = torch.optim.AdamW(param_groups([ctx_enc, pred], wd), lr=lr)
+    pred = FSQPredictor(grid=ctx_enc.grid, fsq_dim=fsq_dim, fsq_L=fsq_L).to(device)
+    # opt = torch.optim.AdamW(param_groups([ctx_enc, pred], wd), lr=lr)
     total = epochs * len(loader); rng = random.Random(0); losses = []; step = 0
     D = ctx_enc.dim
+
+    ctx_proj = nn.Linear(D, fsq_dim).to(device)
+    tgt_proj = copy.deepcopy(ctx_proj).to(device)
+    for p in tgt_proj.parameters(): p.requires_grad_(False)
+    quantizer = fsq.FSQ(levels =[fsq_L for _ in range(fsq_dim)]).to(device)
+    opt = torch.optim.AdamW(param_groups([ctx_enc, pred, ctx_proj], wd), lr=lr)
     if on_epoch_end is not None:
         on_epoch_end({"epoch": -1, "ctx_enc": ctx_enc, "tgt_enc": tgt_enc,
                       "predictor": pred, "step": 0})
@@ -143,24 +198,61 @@ def train(epochs=8, batch_size=256, lr=3e-4, wd=0.05, ema_start=0.996, ema_end=1
             for g in opt.param_groups: g["lr"] = lr_warmup_cosine(step, total, lr)
             with torch.no_grad(): full = F.layer_norm(tgt_enc(imgs), (D,))  # LN(s_y); no_grad = stop-gradient
             ce = ctx_enc(imgs, ci)                                          # s_x = f_theta(x_context)
-            loss = sum(
-                F.smooth_l1_loss(
-                    pred(ce, ci, ti),                                       # hat_s_y(i) = g_phi(s_x, B_i)
-                    full.gather(1, ti.unsqueeze(-1).expand(-1, -1, D)))     # [LN(s_y)]_{B_i}
-                for ti in tis                                               # for i in 1..M
-            ) / len(tis)                                                    # (1/M) * sum
+            # loss = sum(
+            #     F.smooth_l1_loss(
+            #         pred(ce, ci, ti),                                       # hat_s_y(i) = g_phi(s_x, B_i)
+            #         full.gather(1, ti.unsqueeze(-1).expand(-1, -1, D)))     # [LN(s_y)]_{B_i}
+            #     for ti in tis                                               # for i in 1..M
+            # ) / len(tis)                                                    # (1/M) * sum
+
+            # FSQ VARIANT
+
+            loss = torch.tensor(0.0, device=device)
+
+            all_flat_idx = []
+
+            for ti in tis:
+                tgt_feats = full.gather(1, ti.unsqueeze(-1).expand(-1, -1, D))  # (B, T, D)
+                projected = tgt_proj(tgt_feats)  # (B, T, fsq_dim)
+                # _, flat_idx = quantizer(projected)  # flat_idx: (B, T)
+                # level_idx = torch.stack([  # (B, T, fsq_dim)
+                #     (flat_idx // (fsq_L ** i)) % fsq_L
+                #     for i in range(fsq_dim)
+                # ], dim=-1)
+                quantized, flat_idx = quantizer(projected)  # (B, T, fsq_dim), values in {-3..3}
+                level_idx = (quantized + (fsq_L - 1) // 2).long()  # (B, T, fsq_dim), values in {0..fsq_L-1}
+                out = pred(ce, ci, ti)  # (B, T, fsq_dim*fsq_L)
+
+                B, T, _ = out.shape
+                out = out.view(B, T, fsq_dim, fsq_L)  # (B, T, d, L)
+                loss += F.cross_entropy(
+                    out.permute(0, 3, 1, 2),  # (B, L, T, d)
+                    level_idx.long()  # (B, T, d)
+                )
+                with torch.no_grad():
+                    all_flat_idx.append(flat_idx.detach().cpu())
+
+            metrics = compute_fsq_metrics(flat_idx, fsq_L ** fsq_dim)
+            loss = loss / len(tis)
+
             opt.zero_grad(); loss.backward(); opt.step()
             m = ema_start + (ema_end - ema_start) * (step / max(1, total - 1))
             ema_update(tgt_enc, ctx_enc, m); losses.append(loss.item())
+            ema_update(tgt_proj, ctx_proj, m)
             if step % 50 == 0:
                 print(f"ep={epoch} step={step:5d} loss={loss.item():.4f} "
                       f"lr={opt.param_groups[0]['lr']:.2e} ema={m:.4f}")
+                print(f"epoch codebook usage: {metrics['codebook_usage_pct']:.1f}%")
+                print(f"epoch normalized perplexity: {metrics['normalized_perplexity']:.3f}")
 
             wandb.log({"loss": loss.item(),
                        "lr": opt.param_groups[0]['lr'],
                        "ema": m,
+                       "codebook usage": metrics['codebook_usage_pct'],
+                       "normalized perplexity": metrics['normalized_perplexity'],
+                       "perplexity": metrics['perplexity'],
                        "global_step": step})
-
+            
             step += 1
         if on_epoch_end is not None:
             on_epoch_end({"epoch": epoch, "ctx_enc": ctx_enc, "tgt_enc": tgt_enc,
