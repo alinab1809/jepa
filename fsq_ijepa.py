@@ -185,6 +185,9 @@ def train(epochs=8, batch_size=256, lr=3e-4, wd=0.05, ema_start=0.996, ema_end=1
     tgt_proj = copy.deepcopy(ctx_proj).to(device)
     for p in tgt_proj.parameters(): p.requires_grad_(False)
     quantizer = fsq.FSQ(levels =[fsq_L for _ in range(fsq_dim)]).to(device)
+    # levels_list = torch.linspace(-(fsq_L - 1) // 2, (fsq_L - 1) // 2, fsq_L).to(device)
+    # level_vals = levels_list.view(1, 1, 1, fsq_L)
+    
     opt = torch.optim.AdamW(param_groups([ctx_enc, pred, ctx_proj], wd), lr=lr)
     if on_epoch_end is not None:
         on_epoch_end({"epoch": -1, "ctx_enc": ctx_enc, "tgt_enc": tgt_enc,
@@ -229,10 +232,14 @@ def train(epochs=8, batch_size=256, lr=3e-4, wd=0.05, ema_start=0.996, ema_end=1
                     out.permute(0, 3, 1, 2),  # (B, L, T, d)
                     level_idx.long()  # (B, T, d)
                 )
+                # soft_pred = (out.softmax(-1) * level_vals).sum(-1)  # (B, T, fsq_dim)
+                # aux_loss = F.smooth_l1_loss(soft_pred, projected.detach())
+                # loss += 0.1 * aux_loss
+
                 with torch.no_grad():
                     all_flat_idx.append(flat_idx.detach().cpu())
 
-            metrics = compute_fsq_metrics(flat_idx, fsq_L ** fsq_dim)
+            metrics = compute_fsq_metrics(torch.cat(all_flat_idx, dim=1), fsq_L ** fsq_dim)
             loss = loss / len(tis)
 
             opt.zero_grad(); loss.backward(); opt.step()

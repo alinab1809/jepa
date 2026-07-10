@@ -116,6 +116,7 @@ def linear_probe(encoder, test_loader, device, epochs=3, batch_size=512):
         correct += (pred == y).sum().item(); total += y.numel()
     acc = correct / total
     print(f"linear probe test accuracy: {acc:.4f}")
+    wandb.log({"linear probe acc": acc})
     return acc
 
 
